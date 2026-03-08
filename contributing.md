@@ -1,12 +1,27 @@
 # Contributing
 
-Testing Locally:
+## Testing locally
 
 ```shell
-asdf plugin test <plugin-name> <plugin-url> [--asdf-tool-version <version>] [--asdf-plugin-gitref <git-ref>] [test-command*]
+# With asdf:
+asdf plugin test aspire https://github.com/zacdirect/mise-aspire.git "aspire --version"
 
-# TODO: adapt this
-asdf plugin test aspire https://github.com/zacdirect/asdf-aspire.git "aspire --version"
+# With mise:
+mise plugin add aspire https://github.com/zacdirect/mise-aspire.git
+mise install aspire@daily
+aspire --version
+```
+
+## Lint & format
+
+```shell
+# Install shellcheck and shfmt via asdf/.tool-versions
+asdf plugin add shellcheck https://github.com/luizm/asdf-shellcheck.git
+asdf plugin add shfmt https://github.com/luizm/asdf-shfmt.git
+asdf install
+
+./scripts/lint.bash
+./scripts/format.bash
 ```
 
 Tests are automatically run in GitHub Actions on push and PR.

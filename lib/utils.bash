@@ -2,73 +2,155 @@
 
 set -euo pipefail
 
-# TODO: Ensure this is the correct GitHub homepage where releases can be downloaded for aspire.
-GH_REPO="https://github.com/dotnet/aspire"
 TOOL_NAME="aspire"
 TOOL_TEST="aspire --version"
 
+# Aspire CLI binaries are distributed as nightly builds from ci.dot.net.
+# GitHub releases exist but carry no binary assets.
+#
+# Two version identifiers are supported:
+#   daily       — rolling nightly via aka.ms redirect; no checksum available
+#   <specific>  — e.g. 9.3.0-preview.1.25201.3; SHA-512 verified from ci.dot.net
+#
+# PINNING WORKFLOW
+#   1. Install the rolling nightly:   mise install aspire@daily
+#   2. Note the exact build:          aspire --version  (→ 9.3.0-preview.1.25201.3)
+#   3. Add to mise.toml:              aspire = "9.3.0-preview.1.25201.3"
+#   4. Re-run mise install            → downloads & verifies that exact build
+
 fail() {
-	echo -e "asdf-$TOOL_NAME: $*"
-	exit 1
+  echo "asdf-$TOOL_NAME: $*" >&2
+  exit 1
 }
 
-curl_opts=(-fsSL)
+# ── Platform detection ──────────────────────────────────────────────────────
 
-# NOTE: You might want to remove this if aspire is not hosted on GitHub releases.
-if [ -n "${GITHUB_API_TOKEN:-}" ]; then
-	curl_opts=("${curl_opts[@]}" -H "Authorization: token $GITHUB_API_TOKEN")
-fi
+get_rid() {
+  local os arch
+  os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  case "$os" in
+    darwin) os="osx" ;;
+    linux)
+      if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -q musl; then
+        os="linux-musl"
+      fi
+      ;;
+    *) fail "Unsupported OS: $os" ;;
+  esac
+
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64 | amd64) arch="x64" ;;
+    aarch64 | arm64) arch="arm64" ;;
+    *) fail "Unsupported architecture: $arch" ;;
+  esac
+
+  echo "${os}-${arch}"
+}
+
+# ── Version listing ─────────────────────────────────────────────────────────
 
 sort_versions() {
-	sed 'h; s/[+-]/./g; s/.p\([[:digit:]]\)/.z\1/; s/$/.z/; G; s/\n/ /' |
-		LC_ALL=C sort -t. -k 1,1 -k 2,2n -k 3,3n -k 4,4n -k 5,5n | awk '{print $2}'
-}
-
-list_github_tags() {
-	git ls-remote --tags --refs "$GH_REPO" |
-		grep -o 'refs/tags/.*' | cut -d/ -f3- |
-		sed 's/^v//' # NOTE: You might want to adapt this sed to remove non-version strings from tags
+  # Standard semver-aware sort used by the asdf ecosystem.
+  sed 'h; s/[+-]/./g; s/.p\([[:digit:]]\)/.z\1/; s/$/.z/; G; s/\n/ /' |
+    LC_ALL=C sort -t. -k 1,1 -k 2,2n -k 3,3n -k 4,4n -k 5,5n | awk '{print $2}'
 }
 
 list_all_versions() {
-	# TODO: Adapt this. By default we simply list the tag names from GitHub releases.
-	# Change this function if aspire has other means of determining installable versions.
-	list_github_tags
+  # 'daily' is always available as the rolling nightly.
+  echo "daily"
+
+  # Surface any pinned builds already installed locally, so users can
+  # re-select them in mise.toml after noting the version from `aspire --version`.
+  local mise_data installs
+  mise_data="${ASDF_DATA_DIR:-${MISE_DATA_DIR:-$HOME/.local/share/mise}}"
+  installs="${mise_data}/installs/aspire"
+  if [ -d "${installs}" ]; then
+    find "${installs}" -mindepth 1 -maxdepth 1 -type d \
+      -exec basename {} \; |
+      grep -v '^daily$' |
+      sort -rV ||
+      true
+  fi
 }
+
+# ── Download ─────────────────────────────────────────────────────────────────
 
 download_release() {
-	local version filename url
-	version="$1"
-	filename="$2"
+  local version filename rid archive_url checksum_url
+  version="$1"
+  filename="$2"
+  rid="$(get_rid)"
 
-	# TODO: Adapt the release URL convention for aspire
-	url="$GH_REPO/archive/v${version}.tar.gz"
+  if [ "$version" = "daily" ]; then
+    # aka.ms always redirects to the latest nightly build; no checksum available.
+    archive_url="https://aka.ms/dotnet/9/aspire/daily/aspire-cli-${rid}.tar.gz"
+    checksum_url=""
+  else
+    # Specific nightly builds are hosted on ci.dot.net with SHA-512 checksums.
+    archive_url="https://ci.dot.net/public/aspire/${version}/aspire-cli-${rid}-${version}.tar.gz"
+    checksum_url="https://ci.dot.net/public-checksums/aspire/${version}/aspire-cli-${rid}-${version}.tar.gz.sha512"
+  fi
 
-	echo "* Downloading $TOOL_NAME release $version..."
-	curl "${curl_opts[@]}" -o "$filename" -C - "$url" || fail "Could not download $url"
+  echo "* Downloading $TOOL_NAME $version for ${rid}..."
+  curl -fsSL --retry 3 --max-time 600 "$archive_url" -o "$filename" ||
+    fail "Could not download $archive_url"
+
+  if [ -n "$checksum_url" ]; then
+    local checksum_file expected actual
+    checksum_file="${filename}.sha512"
+    curl -fsSL --retry 3 --max-time 60 "$checksum_url" -o "$checksum_file" ||
+      fail "Could not download checksum from $checksum_url"
+
+    expected="$(tr -d '\n\r' <"$checksum_file" | tr '[:upper:]' '[:lower:]')"
+    if command -v sha512sum >/dev/null 2>&1; then
+      actual="$(sha512sum "$filename" | cut -d' ' -f1)"
+    elif command -v shasum >/dev/null 2>&1; then
+      actual="$(shasum -a 512 "$filename" | cut -d' ' -f1)"
+    else
+      fail "No sha512sum or shasum found — cannot verify checksum"
+    fi
+
+    [ "$expected" = "$actual" ] ||
+      fail "SHA-512 mismatch for $archive_url"$'\n'"  expected: $expected"$'\n'"  actual:   $actual"
+
+    rm -f "$checksum_file"
+  fi
 }
 
+# ── Install ───────────────────────────────────────────────────────────────────
+
 install_version() {
-	local install_type="$1"
-	local version="$2"
-	local install_path="${3%/bin}/bin"
+  local install_type version install_path install_root bin_dir
+  install_type="$1"
+  version="$2"
+  install_path="$3"
 
-	if [ "$install_type" != "version" ]; then
-		fail "asdf-$TOOL_NAME supports release installs only"
-	fi
+  if [ "$install_type" != "version" ]; then
+    fail "asdf-$TOOL_NAME supports version installs only"
+  fi
 
-	(
-		mkdir -p "$install_path"
-		cp -r "$ASDF_DOWNLOAD_PATH"/* "$install_path"
+  # The tarball ships aspire + libsodium.so at the archive root.
+  # aspire resolves libsodium.so via $ORIGIN rpath, so both files must live
+  # in the same directory.  We keep them at the install root and expose only
+  # the aspire binary via a bin/ symlink so mise shims just that executable.
+  install_root="${install_path%/bin}"
+  bin_dir="${install_root}/bin"
 
-		# TODO: Assert aspire executable exists.
-		local tool_cmd
-		tool_cmd="$(echo "$TOOL_TEST" | cut -d' ' -f1)"
-		test -x "$install_path/$tool_cmd" || fail "Expected $install_path/$tool_cmd to be executable."
+  (
+    mkdir -p "$install_root"
+    cp -r "$ASDF_DOWNLOAD_PATH/." "$install_root/"
+    chmod +x "${install_root}/aspire"
 
-		echo "$TOOL_NAME $version installation was successful!"
-	) || (
-		rm -rf "$install_path"
-		fail "An error occurred while installing $TOOL_NAME $version."
-	)
+    mkdir -p "$bin_dir"
+    ln -sf "../aspire" "${bin_dir}/aspire"
+
+    test -x "${bin_dir}/aspire" ||
+      fail "Expected ${bin_dir}/aspire to be executable."
+
+    echo "$TOOL_NAME $version installation was successful!"
+  ) || (
+    rm -rf "$install_root"
+    fail "An error occurred while installing $TOOL_NAME $version."
+  )
 }

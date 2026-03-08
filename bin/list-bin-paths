@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+# Tells mise/asdf where binaries live within $ASDF_INSTALL_PATH.
+# We expose only bin/ (which contains a symlink to the real aspire binary)
+# so that libsodium.so at the install root is never shimmed.
+echo "bin"
